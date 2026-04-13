@@ -5,7 +5,8 @@ __pycache__/
 .env
 results/figures/*.png
 results/tables/*.csv
-data/cache/
+data/cache/*
+
 *.ckpt
 *.bin
 *.safetensors

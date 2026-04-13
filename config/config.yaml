@@ -6,26 +6,29 @@ dataset:
   name: "cnn_dailymail"
   version: "3.0.0"
   cache_dir: "./data/cache"
-  max_input_length: 1024
   max_target_length: 128
   train_subset: 20000
   val_subset: 1000
   test_subset: 1000
 
-# Models
+# Models — each with its own max_input_length reflecting architectural limits
 models:
   t5:
     name: "google/flan-t5-large"
     type: "seq2seq"
+    max_input_length: 512     # T5 native context window
   qwen:
     name: "Qwen/Qwen3-1.7B"
     type: "causal"
+    max_input_length: 1536    # Qwen3 supports up to 32k; 1536 covers ~p95 of articles
   bart_reference:
     name: "facebook/bart-large-cnn"
     type: "seq2seq"
+    max_input_length: 1024 #Native context window
   pegasus_reference:
     name: "google/pegasus-cnn_dailymail"
     type: "seq2seq"
+    max_input_length: 1024    # Pegasus native context window
 
 # Training
 training:
