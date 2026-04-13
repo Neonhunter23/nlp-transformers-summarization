@@ -1,0 +1,65 @@
+# Reproducibility
+seed: 42
+
+# Dataset
+dataset:
+  name: "cnn_dailymail"
+  version: "3.0.0"
+  cache_dir: "./data/cache"
+  max_input_length: 1024
+  max_target_length: 128
+  train_subset: 20000
+  val_subset: 1000
+  test_subset: 1000
+
+# Models
+models:
+  t5:
+    name: "google/flan-t5-large"
+    type: "seq2seq"
+  qwen:
+    name: "Qwen/Qwen3-1.7B"
+    type: "causal"
+  bart_reference:
+    name: "facebook/bart-large-cnn"
+    type: "seq2seq"
+  pegasus_reference:
+    name: "google/pegasus-cnn_dailymail"
+    type: "seq2seq"
+
+# Training
+training:
+  output_dir: "./results/checkpoints"
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 3.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  fp16: false
+  bf16: true        #hardware decision
+  logging_steps: 50
+  eval_strategy: "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 2
+
+# LoRA (Qwen3)
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+# Generation
+generation:
+  num_beams: 4
+  no_repeat_ngram_size: 3
+  length_penalty: 2.0
+  early_stopping: true
+
+# Paths
+paths:
+  results: "./results"
+  figures: "./results/figures"
+  tables: "./results/tables"
