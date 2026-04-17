@@ -14,9 +14,10 @@ dataset:
 # Models — each with its own max_input_length reflecting architectural limits
 models:
   t5:
-    name: "google/flan-t5-large"
+    name: "google/flan-t5-base"
     type: "seq2seq"
-    max_input_length: 512     # T5 native context window
+    max_input_length: 512
+    dtype: "float32"
   qwen:
     name: "Qwen/Qwen3-1.7B"
     type: "causal"

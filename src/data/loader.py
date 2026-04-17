@@ -5,9 +5,34 @@ from datasets import load_dataset, DatasetDict
 
 
 def load_config(config_path: str = "config/config.yaml") -> dict:
-    """loads config.yaml"""
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    """Load global configuration from YAML.
+
+    Resolves relative paths in the config (e.g. output_dir, cache_dir)
+    against the project root, which is the parent of the config file.
+    This guarantees consistent behavior whether the function is called
+    from a notebook, a script, or any other entry point.
+    """
+    config_file = Path(config_path).resolve()
+    project_root = config_file.parent.parent  # config/ is a direct child of root
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    # Resolve known path fields to absolute paths anchored at project root.
+    path_fields = [
+        ("dataset", "cache_dir"),
+        ("training", "output_dir"),
+        ("paths", "results"),
+        ("paths", "figures"),
+        ("paths", "tables"),
+    ]
+    for section, field in path_fields:
+        if section in cfg and field in cfg[section]:
+            raw = cfg[section][field]
+            if not Path(raw).is_absolute():
+                cfg[section][field] = str((project_root / raw).resolve())
+
+    return cfg
 
 
 def load_cnn_dailymail(config: dict) -> DatasetDict:
