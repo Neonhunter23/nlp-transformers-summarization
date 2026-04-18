@@ -4,8 +4,14 @@ Encapsulates the full pipeline for a single configuration: build trainer,
 train, evaluate on the test subset, and persist results to CSV.
 
 The runner is model-family agnostic (handles both seq2seq and causal via
-LoraModel/full fine-tuning) so the same interface works for Flan-T5 and
+LoRA/full fine-tuning) so the same interface works for Flan-T5 and
 Qwen3 experiments.
+
+Features:
+- Skip already-completed experiments (CSV exists) for safe re-runs.
+- Resume interrupted training from the last saved checkpoint.
+- Aggressive VRAM cleanup between experiments.
+- Fault-tolerant suite runner: if one experiment crashes, the rest continue.
 """
 from __future__ import annotations
 
@@ -18,7 +24,6 @@ from typing import Any
 
 import pandas as pd
 import torch
-from peft import PeftModel
 
 from src.data.loader import load_cnn_dailymail
 from src.data.preprocessing import (
@@ -100,6 +105,29 @@ def _prepare_lora_config(cfg: dict, overrides: dict[str, Any]) -> dict:
     return new_cfg
 
 
+def _get_tables_dir(cfg: dict) -> Path:
+    """Resolve the tables output directory from config."""
+    raw = cfg.get("paths", {}).get("tables", "results/tables")
+    return Path(raw)
+
+
+def _find_last_checkpoint(checkpoint_dir: Path) -> str | None:
+    """Find the last saved checkpoint in a directory, if any.
+
+    Returns the path as a string (for Trainer compatibility), or None
+    if no checkpoint exists.
+    """
+    if not checkpoint_dir.exists():
+        return None
+    ckpts = sorted(
+        [p for p in checkpoint_dir.iterdir() if p.name.startswith("checkpoint-")],
+        key=lambda p: int(p.name.split("-")[-1]),
+    )
+    if ckpts:
+        return str(ckpts[-1])
+    return None
+
+
 def run_experiment(
     cfg: dict,
     spec: ExperimentSpec,
@@ -107,9 +135,13 @@ def run_experiment(
 ) -> dict:
     """Run a single V3 experiment end-to-end.
 
-    Steps: load dataset -> tokenize -> load model -> (optionally wrap LoRA) ->
-    build trainer -> train -> restore inference mode -> evaluate on test ->
-    write per-experiment CSV row.
+    Steps: check if already done -> load dataset -> tokenize -> load model ->
+    (optionally wrap LoRA) -> build trainer -> train (with resume support) ->
+    restore inference mode -> evaluate on test -> write per-experiment CSV row.
+
+    If the experiment's result CSV already exists, the experiment is skipped
+    entirely and the saved results are returned. If a partial checkpoint exists
+    but no result CSV, training resumes from the last checkpoint.
 
     Args:
         cfg: Global config dict (from load_config).
@@ -124,7 +156,17 @@ def run_experiment(
     print(f"\n{'='*70}\n[{spec.name}] Starting experiment\n{'='*70}")
     print(f"Spec: {asdict(spec)}")
 
-    # Per-experiment config patches
+    # --- SKIP CHECK ---
+    # If the result CSV already exists, this experiment completed in a
+    # previous run. Skip it entirely to save time on re-runs.
+    tables_dir = _get_tables_dir(cfg)
+    result_csv = tables_dir / f"{spec.name}.csv"
+    if result_csv.exists():
+        print(f"[{spec.name}] Already completed (CSV found at {result_csv}). Skipping.")
+        return pd.read_csv(result_csv).iloc[0].to_dict()
+
+    # --- CONFIG PATCHES ---
+    # Deep-copy to avoid mutating the shared config across experiments.
     exp_cfg = copy.deepcopy(cfg)
     exp_cfg["dataset"]["train_subset"] = spec.train_subset
     exp_cfg["training"]["num_train_epochs"] = spec.num_epochs
@@ -133,13 +175,13 @@ def run_experiment(
     model_type = model_cfg["type"]
     is_causal = model_type == "causal"
 
-    # Load dataset
+    # --- DATASET ---
     dataset = load_cnn_dailymail(exp_cfg)
 
-    # Load model fresh for this experiment
+    # --- MODEL ---
     loaded = load_model(model_cfg)
 
-    # Build preprocessing function per model type
+    # --- PREPROCESSING ---
     train_max_input = spec.train_max_input or model_cfg["max_input_length"]
     if is_causal:
         preprocess_fn = build_causal_preprocess_fn(
@@ -156,12 +198,12 @@ def run_experiment(
         )
     tokenized = tokenize_dataset(dataset, preprocess_fn)
 
-    # Apply LoRA for causal models with optional overrides
+    # --- LORA (causal only) ---
     if is_causal:
         exp_cfg = _prepare_lora_config(exp_cfg, spec.lora_overrides)
         loaded = apply_lora(loaded, exp_cfg)
 
-    # Build appropriate trainer
+    # --- TRAINER ---
     if is_causal:
         trainer = build_causal_trainer(
             loaded=loaded,
@@ -185,18 +227,27 @@ def run_experiment(
             **spec.extra_trainer_kwargs,
         )
 
-    # Train
+    # --- TRAIN (with checkpoint resumption) ---
+    checkpoint_dir = Path(exp_cfg["training"]["output_dir"]) / spec.name
+    last_ckpt = _find_last_checkpoint(checkpoint_dir)
+    if last_ckpt:
+        print(f"[{spec.name}] Resuming training from {last_ckpt}")
+    else:
+        print(f"[{spec.name}] Starting training from scratch")
+
     train_start = time.time()
-    train_result = trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=last_ckpt)
     trainer.save_model()
     train_elapsed = time.time() - train_start
     print(f"[{spec.name}] Training finished in {train_elapsed/60:.1f} min")
 
-    # Restore inference mode before generation
+    # --- RESTORE INFERENCE MODE ---
+    # Training leaves gradient_checkpointing=True and use_cache=False,
+    # which causes degenerate generation with beam search.
     _restore_inference_mode(loaded)
     loaded.tokenizer.padding_side = "left" if is_causal else "right"
 
-    # Evaluate on fixed test subset
+    # --- EVALUATE ---
     test_subset = dataset["test"].select(range(test_subset_size))
     articles = test_subset["article"]
     references = test_subset["highlights"]
@@ -213,7 +264,7 @@ def run_experiment(
 
     rouge_scores = compute_rouge(preds, references)
 
-    # Assemble result record
+    # --- ASSEMBLE RESULT ---
     result = {
         "experiment": spec.name,
         "model_key": spec.model_key,
@@ -228,20 +279,19 @@ def run_experiment(
         "lora_overrides": str(spec.lora_overrides) if spec.lora_overrides else "",
     }
 
-    # Persist individual CSV
-    tables_dir = Path(exp_cfg["paths"]["tables"]) if "paths" in exp_cfg else Path("results/tables")
+    # --- PERSIST ---
     tables_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([result]).to_csv(tables_dir / f"{spec.name}.csv", index=False)
+    pd.DataFrame([result]).to_csv(result_csv, index=False)
 
     print(f"[{spec.name}] Results: {rouge_scores}")
-    print(f"[{spec.name}] CSV saved to {tables_dir / f'{spec.name}.csv'}")
+    print(f"[{spec.name}] CSV saved to {result_csv}")
 
     # Show one qualitative example
     print(f"\n[{spec.name}] Qualitative example:")
     print(f"REFERENCE:\n{references[0]}")
     print(f"\nPREDICTION:\n{preds[0]}\n")
 
-    # Clean up VRAM for next experiment
+    # --- CLEANUP ---
     del trainer, loaded, tokenized, dataset
     _free_gpu_memory()
 
@@ -257,8 +307,9 @@ def run_experiment_suite(
     """Run a list of experiments sequentially and write a combined CSV.
 
     Experiments that crash are skipped with a logged error; the suite
-    continues with the remaining specs. This matters for long overnight runs
-    where a single OOM shouldn't kill the whole sweep.
+    continues with the remaining specs. Already-completed experiments
+    (from a previous interrupted run) are loaded from their saved CSVs
+    instead of re-running.
 
     Args:
         cfg: Global config dict.
@@ -272,7 +323,8 @@ def run_experiment_suite(
     """
     results: list[dict] = []
 
-    for spec in specs:
+    for i, spec in enumerate(specs):
+        print(f"\n Experiment {i+1}/{len(specs)}: {spec.name}")
         try:
             result = run_experiment(cfg, spec, test_subset_size=test_subset_size)
             results.append(result)
@@ -282,14 +334,15 @@ def run_experiment_suite(
             _free_gpu_memory()
 
     if not results:
-        print(" No experiments completed successfully.")
+        print("No experiments completed successfully.")
         return pd.DataFrame()
 
     df = pd.DataFrame(results).sort_values("rougeL", ascending=False).reset_index(drop=True)
 
-    tables_dir = Path(cfg["paths"]["tables"]) if "paths" in cfg else Path("results/tables")
+    tables_dir = _get_tables_dir(cfg)
     tables_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(tables_dir / combined_csv_name, index=False)
-    print(f"\n Suite finished. Combined CSV: {tables_dir / combined_csv_name}")
+    print(f"\n Suite finished. {len(results)}/{len(specs)} experiments completed.")
+    print(f"Combined CSV: {tables_dir / combined_csv_name}")
 
     return df
